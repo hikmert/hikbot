@@ -5,6 +5,7 @@ import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, SetEnvironmentVariable
+from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
@@ -21,6 +22,7 @@ STATIC_TFS = [
     ('base_link', 'laser_back_link',  -0.27,  0.00, 0.04, 0.0, 0.0,  3.14159265),
     ('base_link', 'laser_left_link',   0.00,  0.18, 0.04, 0.0, 0.0,  1.5707963),
     ('base_link', 'laser_right_link',  0.00, -0.18, 0.04, 0.0, 0.0, -1.5707963),
+    ('base_link', 'lidar_link',        0.00,  0.00, 0.13, 0.0, 0.0,  0.0),
 ]
 
 
@@ -33,10 +35,15 @@ def generate_launch_description():
     models_dir = os.path.join(pkg_share, 'models')
 
     use_sim_time = LaunchConfiguration('use_sim_time')
+    launch_rviz = LaunchConfiguration('launch_rviz')
 
     declare_use_sim_time = DeclareLaunchArgument(
         'use_sim_time', default_value='true',
         description='Use simulated /clock from Gazebo.')
+
+    declare_launch_rviz = DeclareLaunchArgument(
+        'launch_rviz', default_value='true',
+        description='Launch default RViz with the warehouse config.')
 
     # Make our local models discoverable by Gazebo (for any future <include>s)
     set_resource_path = SetEnvironmentVariable(
@@ -92,6 +99,18 @@ def generate_launch_description():
         output='screen',
     )
 
+    # Bridge DiffDrive's Pose_V (gz) → /tf (ROS) so odom→base_link gets published.
+    # Must run un-namespaced — /tf is a global topic.
+    tf_bridge = Node(
+        package='ros_gz_bridge',
+        executable='parameter_bridge',
+        name='tf_bridge',
+        arguments=['/model/hikbot/tf_diff@tf2_msgs/msg/TFMessage[gz.msgs.Pose_V'],
+        remappings=[('/model/hikbot/tf_diff', '/tf')],
+        parameters=[{'use_sim_time': use_sim_time}],
+        output='screen',
+    )
+
     static_tf_nodes = []
     for parent, child, x, y, z, roll, pitch, yaw in STATIC_TFS:
         static_tf_nodes.append(Node(
@@ -113,15 +132,18 @@ def generate_launch_description():
         arguments=['-d', rviz_config],
         parameters=[{'use_sim_time': use_sim_time}],
         output='screen',
+        condition=IfCondition(launch_rviz),
     )
 
     return LaunchDescription([
         declare_use_sim_time,
+        declare_launch_rviz,
         set_resource_path,
         gz_sim,
         spawn_robot,
         clock_bridge,
         sensor_bridge,
+        tf_bridge,
         *static_tf_nodes,
         rviz,
     ])
