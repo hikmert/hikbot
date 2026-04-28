@@ -8,4 +8,9 @@ install(
   DESTINATION share/${PROJECT_NAME}
 )
 
+install(
+  PROGRAMS scripts/autonomous_mapper.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 ament_package()
