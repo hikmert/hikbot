@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 import rclpy
+from action_msgs.msg import GoalStatus, GoalStatusArray
 from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import OccupancyGrid, Path
 from rclpy.duration import Duration
@@ -131,12 +132,26 @@ class AutonomousMapper(Node):
         self.goal_pub = self.create_publisher(PoseStamped, "exploration_goal", 10)
         self.marker_pub = self.create_publisher(MarkerArray, "exploration_markers", 10)
 
+        self.nav2_active = False
+
         self.create_subscription(LaserScan, "scan", self.on_scan, 10)
         self.create_subscription(OccupancyGrid, "/map", self.on_map, map_qos)
+        self.create_subscription(
+            GoalStatusArray,
+            '/navigate_to_pose/_action/status',
+            self._on_nav2_status,
+            10,
+        )
         self.create_timer(1.0 / control_rate, self.on_timer)
 
         self.get_logger().info(
             "Frontier explorer ready: SLAM map -> frontier target -> inflated-grid A* -> LiDAR-safe drive."
+        )
+
+    def _on_nav2_status(self, msg: GoalStatusArray):
+        self.nav2_active = any(
+            status.status in (GoalStatus.STATUS_ACCEPTED, GoalStatus.STATUS_EXECUTING)
+            for status in msg.status_list
         )
 
     def on_scan(self, msg: LaserScan):
@@ -149,6 +164,10 @@ class AutonomousMapper(Node):
         self.blocked = self.build_blocked_grid(msg)
 
     def on_timer(self):
+        if self.nav2_active:
+            self.publish_stop()
+            return
+
         if not self.inputs_ready():
             self.publish_stop()
             return

@@ -38,6 +38,13 @@ pkill -9 -f "static_transform"      2>/dev/null || true
 pkill -9 -f "rviz2"                 2>/dev/null || true
 pkill -9 -f "robot_state_publisher" 2>/dev/null || true
 pkill -9 -f "teleop_twist_keyboard" 2>/dev/null || true
+pkill -9 -f "controller_server"     2>/dev/null || true
+pkill -9 -f "planner_server"        2>/dev/null || true
+pkill -9 -f "behavior_server"       2>/dev/null || true
+pkill -9 -f "bt_navigator"          2>/dev/null || true
+pkill -9 -f "velocity_smoother"     2>/dev/null || true
+pkill -9 -f "lifecycle_manager"     2>/dev/null || true
+pkill -9 -f "map_manager_gui.py"    2>/dev/null || true
 sleep 2
 ok "All old processes killed."
 
@@ -110,6 +117,13 @@ cleanup() {
     pkill -9 -f "static_transform"      2>/dev/null || true
     pkill -9 -f "rviz2"                 2>/dev/null || true
     pkill -9 -f "teleop_twist_keyboard" 2>/dev/null || true
+    pkill -9 -f "controller_server"     2>/dev/null || true
+    pkill -9 -f "planner_server"        2>/dev/null || true
+    pkill -9 -f "behavior_server"       2>/dev/null || true
+    pkill -9 -f "bt_navigator"          2>/dev/null || true
+    pkill -9 -f "velocity_smoother"     2>/dev/null || true
+    pkill -9 -f "lifecycle_manager"     2>/dev/null || true
+    pkill -9 -f "map_manager_gui.py"    2>/dev/null || true
     ok "All processes stopped. Bye!"
     exit 0
 }

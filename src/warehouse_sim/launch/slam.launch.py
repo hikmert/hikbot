@@ -1,4 +1,4 @@
-"""Warehouse sim + slam_toolbox online_async + SLAM RViz."""
+"""Warehouse sim + slam_toolbox online_async + Nav2 navigation + SLAM RViz."""
 
 import os
 
@@ -16,10 +16,19 @@ _MAP_FILE = os.path.join(
     'maps', 'warehouse_map'
 )
 
+_NAV_LIFECYCLE_NODES = [
+    'controller_server',
+    'planner_server',
+    'behavior_server',
+    'bt_navigator',
+    'velocity_smoother',
+]
+
 
 def generate_launch_description():
     pkg_share = get_package_share_directory('warehouse_sim')
     slam_params = os.path.join(pkg_share, 'config', 'slam_toolbox.yaml')
+    nav2_params = os.path.join(pkg_share, 'config', 'nav2_params.yaml')
     slam_rviz = os.path.join(pkg_share, 'rviz', 'slam.rviz')
     base_launch = os.path.join(pkg_share, 'launch', 'warehouse.launch.py')
 
@@ -115,12 +124,76 @@ def generate_launch_description():
         parameters=[{'use_sim_time': use_sim_time}],
     )
 
+    # ------------------------------------------------------------------
+    # Nav2 navigation stack (root namespace, action server at /navigate_to_pose)
+    # Commands flow: controller → cmd_vel_nav → velocity_smoother → /hikbot/cmd_vel
+    # ------------------------------------------------------------------
+    tf_remap = [('/tf', 'tf'), ('/tf_static', 'tf_static')]
+
+    controller_server = Node(
+        package='nav2_controller',
+        executable='controller_server',
+        output='screen',
+        parameters=[nav2_params, {'use_sim_time': use_sim_time}],
+        remappings=tf_remap + [('cmd_vel', 'cmd_vel_nav')],
+    )
+
+    planner_server = Node(
+        package='nav2_planner',
+        executable='planner_server',
+        output='screen',
+        parameters=[nav2_params, {'use_sim_time': use_sim_time}],
+        remappings=tf_remap,
+    )
+
+    behavior_server = Node(
+        package='nav2_behaviors',
+        executable='behavior_server',
+        output='screen',
+        parameters=[nav2_params, {'use_sim_time': use_sim_time}],
+        remappings=tf_remap + [('cmd_vel', 'cmd_vel_nav')],
+    )
+
+    bt_navigator = Node(
+        package='nav2_bt_navigator',
+        executable='bt_navigator',
+        output='screen',
+        parameters=[nav2_params, {'use_sim_time': use_sim_time}],
+        remappings=tf_remap,
+    )
+
+    velocity_smoother = Node(
+        package='nav2_velocity_smoother',
+        executable='velocity_smoother',
+        output='screen',
+        parameters=[nav2_params, {'use_sim_time': use_sim_time}],
+        remappings=tf_remap + [('cmd_vel', 'cmd_vel_nav'), ('cmd_vel_smoothed', '/hikbot/cmd_vel')],
+    )
+
+    nav_lifecycle_manager = Node(
+        package='nav2_lifecycle_manager',
+        executable='lifecycle_manager',
+        name='lifecycle_manager_navigation',
+        output='screen',
+        parameters=[{
+            'use_sim_time': use_sim_time,
+            'autostart': True,
+            'node_names': _NAV_LIFECYCLE_NODES,
+        }],
+    )
+
     return LaunchDescription([
         declare_use_sim_time,
         declare_autostart_mapper,
         warehouse,
         slam,
         lifecycle_manager,
+        controller_server,
+        planner_server,
+        behavior_server,
+        bt_navigator,
+        velocity_smoother,
+        nav_lifecycle_manager,
         mapper,
         map_manager,
         rviz,

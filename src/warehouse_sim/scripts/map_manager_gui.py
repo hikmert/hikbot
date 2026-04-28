@@ -14,10 +14,12 @@ from datetime import datetime
 from tkinter import filedialog, messagebox, simpledialog
 
 import rclpy
+from rclpy.action import ActionClient
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from slam_toolbox.srv import DeserializePoseGraph, Reset, SerializePoseGraph
+from nav2_msgs.action import NavigateToPose
 
 from nav_msgs.msg import OccupancyGrid
 from PIL import Image, ImageTk
@@ -25,7 +27,7 @@ from PIL import Image, ImageTk
 MAP_DIR = os.path.expanduser('~/otonom_projeler/hikbot/maps')
 MAP_FILE = os.path.join(MAP_DIR, 'warehouse_map')
 AUTO_SAVE_INTERVAL = 60
-ANNOTATION_SCHEMA = 1
+ANNOTATION_SCHEMA = 2
 
 WORKSPACE_WIDTH = 1000
 WORKSPACE_HEIGHT = 700
@@ -93,10 +95,10 @@ class Annotation:
         return cls(
             id=str(data.get('id') or uuid.uuid4().hex),
             label=str(data.get('label') or 'Annotation'),
-            x=float(data.get('x', WORKSPACE_WIDTH / 2)),
-            y=float(data.get('y', WORKSPACE_HEIGHT / 2)),
-            width=max(1.0, float(data.get('width', 80.0))),
-            height=max(1.0, float(data.get('height', 60.0))),
+            x=float(data.get('x', 0.0)),
+            y=float(data.get('y', 0.0)),
+            width=float(data.get('width', 1.0)),
+            height=float(data.get('height', 1.0)),
             angle=float(data.get('angle', 0.0)),
             color=str(data.get('color') or '#f59e0b'),
         )
@@ -132,6 +134,7 @@ class MapManagerNode(Node):
         self._save_cli = self.create_client(SerializePoseGraph, '/slam_toolbox/serialize_map')
         self._load_cli = self.create_client(DeserializePoseGraph, '/slam_toolbox/deserialize_map')
         self._reset_cli = self.create_client(Reset, '/slam_toolbox/reset')
+        self._nav_cli = ActionClient(self, NavigateToPose, '/navigate_to_pose')
 
         map_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
@@ -158,17 +161,21 @@ class MapManagerNode(Node):
         width = msg.info.width
         height = msg.info.height
         data = bytearray(width * height * 3)
-        for i, val in enumerate(msg.data):
-            offset = i * 3
-            if val == -1:
-                data[offset : offset + 3] = bytes([128, 128, 128])
-            elif val == 0:
-                data[offset : offset + 3] = bytes([255, 255, 255])
-            elif val == 100:
-                data[offset : offset + 3] = bytes([0, 0, 0])
-            else:
-                v = max(0, min(255, 255 - int(val * 2.55)))
-                data[offset : offset + 3] = bytes([v, v, v])
+        for y in range(height):
+            src_row = (height - 1 - y) * width
+            dst_row = y * width
+            for x in range(width):
+                val = msg.data[src_row + x]
+                offset = (dst_row + x) * 3
+                if val == -1:
+                    data[offset : offset + 3] = bytes([128, 128, 128])
+                elif val == 0:
+                    data[offset : offset + 3] = bytes([255, 255, 255])
+                elif val == 100:
+                    data[offset : offset + 3] = bytes([0, 0, 0])
+                else:
+                    v = max(0, min(255, 255 - int(val * 2.55)))
+                    data[offset : offset + 3] = bytes([v, v, v])
         return Image.frombytes('RGB', (width, height), bytes(data))
 
     def save(self, path: str, callback):
@@ -215,6 +222,46 @@ class MapManagerNode(Node):
         except Exception as exc:
             callback(False, str(exc))
 
+    def navigate_to(self, x: float, y: float, start_callback, result_callback=None):
+        threading.Thread(target=self._nav_thread, args=(x, y, start_callback, result_callback), daemon=True).start()
+
+    def _nav_thread(self, x: float, y: float, start_callback, result_callback=None):
+        if not self._nav_cli.wait_for_server(timeout_sec=3.0):
+            start_callback(False, '/navigate_to_pose action not available')
+            return
+        goal = NavigateToPose.Goal()
+        goal.pose.header.frame_id = 'map'
+        goal.pose.header.stamp = self.get_clock().now().to_msg()
+        goal.pose.pose.position.x = x
+        goal.pose.pose.position.y = y
+        goal.pose.pose.orientation.w = 1.0
+        future = self._nav_cli.send_goal_async(goal)
+        deadline = time.time() + 5.0
+        while not future.done() and time.time() < deadline:
+            time.sleep(0.05)
+        if not future.done():
+            start_callback(False, 'Goal send timed out')
+            return
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            start_callback(False, 'Goal rejected by Nav2')
+            return
+        start_callback(True, f'Navigating to ({x:.2f}, {y:.2f})')
+
+        if result_callback:
+            result_future = goal_handle.get_result_async()
+            deadline = time.time() + 120.0
+            while not result_future.done() and time.time() < deadline:
+                time.sleep(0.1)
+            if not result_future.done():
+                result_callback(False, 'Navigation timed out')
+                return
+            try:
+                result_future.result()
+                result_callback(True, 'Arrived')
+            except Exception as exc:
+                result_callback(False, str(exc))
+
     def restart_slam(self, callback):
         threading.Thread(target=self._restart_thread, args=(callback,), daemon=True).start()
 
@@ -257,8 +304,11 @@ class App:
         self._cvar = tk.StringVar(value=f'Auto-save: {AUTO_SAVE_INTERVAL}s')
         self._status_var = tk.StringVar(value='Ready')
 
-        self._drag_start_map: tuple[float, float] | None = None
-        self._last_drag_map: tuple[float, float] | None = None
+        self._navigating_to_id: str | None = None
+        self._arrived_at_id: str | None = None
+
+        self._drag_start_world: tuple[float, float] | None = None
+        self._last_drag_world: tuple[float, float] | None = None
         self._draft_item: int | None = None
         self._dragging_selection = False
         self._lasso_points: list[tuple[float, float]] = []
@@ -266,6 +316,8 @@ class App:
         self._last_canvas_size = (0, 0)
         self._map_photo: ImageTk.PhotoImage | None = None
         self._last_map_info_hash = None
+        self._ann_list_frame: tk.Frame | None = None
+        self._ann_list_canvas: tk.Canvas | None = None
 
         self._build_ui()
         self._node.on_map_update = lambda: self._root.after(0, self._redraw)
@@ -323,6 +375,7 @@ class App:
         tk.Label(right, textvariable=self._cvar, font=('Arial', 9), fg='#777').pack(pady=(6, 8))
         self._build_map_buttons(right)
         self._build_annotation_tools(right)
+        self._build_annotation_list(right)
         tk.Label(right, textvariable=self._annotation_var, anchor='w', justify='left', fg='#555').pack(
             fill='x', pady=(8, 0)
         )
@@ -393,6 +446,95 @@ class App:
         )
         tk.Button(row3, text='Map +90', command=lambda: self._rotate_map(90.0), width=12).pack(side='left')
 
+    def _build_annotation_list(self, parent):
+        lf = tk.LabelFrame(parent, text='Locations', padx=4, pady=4)
+        lf.pack(fill='both', expand=True, pady=(8, 0))
+
+        container = tk.Frame(lf)
+        container.pack(fill='both', expand=True)
+
+        self._ann_list_canvas = tk.Canvas(
+            container, height=140, bg='#1a1a2e', highlightthickness=0
+        )
+        scrollbar = tk.Scrollbar(container, orient='vertical', command=self._ann_list_canvas.yview)
+        self._ann_list_canvas.configure(yscrollcommand=scrollbar.set)
+
+        scrollbar.pack(side='right', fill='y')
+        self._ann_list_canvas.pack(side='left', fill='both', expand=True)
+
+        self._ann_list_frame = tk.Frame(self._ann_list_canvas, bg='#1a1a2e')
+        win = self._ann_list_canvas.create_window((0, 0), window=self._ann_list_frame, anchor='nw')
+
+        self._ann_list_frame.bind(
+            '<Configure>',
+            lambda e: self._ann_list_canvas.configure(scrollregion=self._ann_list_canvas.bbox('all')),
+        )
+        self._ann_list_canvas.bind(
+            '<Configure>',
+            lambda e: self._ann_list_canvas.itemconfig(win, width=e.width),
+        )
+
+    def _refresh_annotation_list(self):
+        if self._ann_list_frame is None:
+            return
+        for widget in self._ann_list_frame.winfo_children():
+            widget.destroy()
+        for ann in self._annotations:
+            row = tk.Frame(self._ann_list_frame, bg='#1a1a2e')
+            row.pack(fill='x', pady=1, padx=2)
+            tk.Label(
+                row,
+                text=ann.label,
+                anchor='w',
+                bg='#1a1a2e',
+                fg='#d4d4d4',
+                font=('Arial', 9),
+            ).pack(side='left', fill='x', expand=True)
+
+            if ann.id == self._arrived_at_id:
+                btn_text = 'Arrived'
+                btn_bg = '#0891b2'
+                btn_hover = '#0e7490'
+            elif ann.id == self._navigating_to_id:
+                btn_text = f'Going to {ann.label}'
+                btn_bg = '#d97706'
+                btn_hover = '#b45309'
+            else:
+                btn_text = 'Go'
+                btn_bg = '#059669'
+                btn_hover = '#047857'
+
+            tk.Button(
+                row,
+                text=btn_text,
+                bg=btn_bg,
+                fg='white',
+                activebackground=btn_hover,
+                font=('Arial', 8, 'bold'),
+                relief='flat',
+                pady=2,
+                command=lambda a=ann: self._navigate_to_annotation(a),
+            ).pack(side='right', padx=(4, 0))
+        if self._ann_list_canvas is not None:
+            self._ann_list_canvas.configure(scrollregion=self._ann_list_canvas.bbox('all'))
+
+    def _navigate_to_annotation(self, ann: Annotation):
+        if self._node.latest_map is None:
+            self._log('ERR No map loaded — cannot navigate')
+            return
+        self._arrived_at_id = None
+        self._navigating_to_id = ann.id
+        self._refresh_annotation_list()
+        self._log(f'Go -> {ann.label} ({ann.x:.2f}, {ann.y:.2f})')
+
+        def on_start(ok, msg):
+            self._root.after(0, self._cb, ok, msg)
+
+        def on_result(ok, msg):
+            self._root.after(0, self._on_nav_result, ok, msg, ann.id)
+
+        self._node.navigate_to(ann.x, ann.y, on_start, on_result)
+
     def _log(self, msg: str):
         stamp = datetime.now().strftime('%H:%M:%S')
         self._log_box.config(state='normal')
@@ -402,6 +544,13 @@ class App:
 
     def _cb(self, ok, msg):
         self._root.after(0, self._log, ('OK  ' if ok else 'ERR ') + msg)
+
+    def _on_nav_result(self, ok: bool, msg: str, annotation_id: str):
+        self._log(('OK  ' if ok else 'ERR ') + msg)
+        self._navigating_to_id = None
+        if ok:
+            self._arrived_at_id = annotation_id
+        self._refresh_annotation_list()
 
     def _set_current_map_label(self):
         self._current_map_var.set(f'Map: {os.path.basename(self._current_map_path)}')
@@ -418,6 +567,7 @@ class App:
     def _annotation_payload(self) -> dict:
         return {
             'schema': ANNOTATION_SCHEMA,
+            'coord': 'world',
             'map_path': self._current_map_path,
             'map_rotation': self._map_rotation,
             'workspace': {
@@ -449,18 +599,38 @@ class App:
             try:
                 with open(path, 'r', encoding='utf-8') as handle:
                     payload = json.load(handle)
+                schema = int(payload.get('schema', 1))
                 self._map_rotation = float(payload.get('map_rotation', 0.0))
                 self._annotations = [
                     Annotation.from_dict(item)
                     for item in payload.get('annotations', [])
                     if isinstance(item, dict)
                 ]
+                if schema < 2:
+                    self._migrate_schema1_annotations()
                 self._log(f'Loaded annotations: {os.path.basename(path)}')
             except (OSError, ValueError, TypeError) as exc:
                 self._log(f'ERR annotation load failed: {exc}')
 
         self._redraw()
         self._update_status()
+        self._refresh_annotation_list()
+
+    def _migrate_schema1_annotations(self):
+        """Convert workspace-pixel coords (schema 1) to world meters (schema 2)."""
+        if self._node.latest_map is None:
+            self._log('WARN: schema 1 annotations loaded without map - positions approximate')
+            return
+        info = self._node.latest_map.info
+        fit = min(WORKSPACE_WIDTH / info.width, WORKSPACE_HEIGHT / info.height)
+        for ann in self._annotations:
+            try:
+                ann.x, ann.y = self._workspace_to_world(ann.x, ann.y)
+                ann.width = ann.width / fit * info.resolution
+                ann.height = ann.height / fit * info.resolution
+            except Exception:
+                pass
+        self._log('Migrated schema 1 annotations to world coordinates')
 
     def _switch_to_map(self, path: str, load_annotations: bool):
         try:
@@ -482,6 +652,73 @@ class App:
             self._last_canvas_size = size
             self._map_photo = None
             self._redraw()
+
+    def _img_fit_scale(self) -> float | None:
+        """Workspace pixels per map image pixel. None if no map."""
+        m = self._node.latest_map
+        if m is None or m.info.width == 0 or m.info.height == 0:
+            return None
+        return min(WORKSPACE_WIDTH / m.info.width, WORKSPACE_HEIGHT / m.info.height)
+
+    def _world_to_workspace(self, wx: float, wy: float) -> tuple[float, float]:
+        info = self._node.latest_map.info
+        fit = min(WORKSPACE_WIDTH / info.width, WORKSPACE_HEIGHT / info.height)
+        px = (wx - info.origin.position.x) / info.resolution
+        py = info.height - (wy - info.origin.position.y) / info.resolution
+        return (
+            WORKSPACE_WIDTH / 2.0 + (px - info.width / 2.0) * fit,
+            WORKSPACE_HEIGHT / 2.0 + (py - info.height / 2.0) * fit,
+        )
+
+    def _workspace_to_world(self, ws_x: float, ws_y: float) -> tuple[float, float]:
+        info = self._node.latest_map.info
+        fit = min(WORKSPACE_WIDTH / info.width, WORKSPACE_HEIGHT / info.height)
+        px = (ws_x - WORKSPACE_WIDTH / 2.0) / fit + info.width / 2.0
+        py = (ws_y - WORKSPACE_HEIGHT / 2.0) / fit + info.height / 2.0
+        wx = info.origin.position.x + px * info.resolution
+        wy = info.origin.position.y + (info.height - py) * info.resolution
+        return wx, wy
+
+    def _canvas_fit_scale(self) -> float:
+        """Canvas pixels per map image pixel (for current canvas size)."""
+        info = self._node.latest_map.info
+        usable_w = max(1, self._canvas.winfo_width() - VIEW_MARGIN * 2)
+        usable_h = max(1, self._canvas.winfo_height() - VIEW_MARGIN * 2)
+        return min(usable_w / info.width, usable_h / info.height)
+
+    def _world_to_canvas(self, wx: float, wy: float) -> tuple[float, float]:
+        """World metres → canvas pixels using PIL-convention rotation (CCW positive)."""
+        info = self._node.latest_map.info
+        fit = self._canvas_fit_scale()
+        px = (wx - info.origin.position.x) / info.resolution
+        py = info.height - (wy - info.origin.position.y) / info.resolution
+        dx = (px - info.width / 2.0) * fit
+        dy = (py - info.height / 2.0) * fit
+        angle = math.radians(self._map_rotation)
+        # PIL rotate(angle) = CCW visual in y-down coords:
+        #   new_dx =  cos(a)*dx + sin(a)*dy
+        #   new_dy = -sin(a)*dx + cos(a)*dy
+        rx = math.cos(angle) * dx + math.sin(angle) * dy
+        ry = -math.sin(angle) * dx + math.cos(angle) * dy
+        view_cx, view_cy, _ = self._view_params()
+        return (view_cx + rx, view_cy + ry)
+
+    def _canvas_to_world(self, cx: float, cy: float) -> tuple[float, float]:
+        """Canvas pixels → world metres (inverse of _world_to_canvas)."""
+        info = self._node.latest_map.info
+        fit = self._canvas_fit_scale()
+        view_cx, view_cy, _ = self._view_params()
+        rx = cx - view_cx
+        ry = cy - view_cy
+        angle = math.radians(self._map_rotation)
+        # Inverse of PIL CCW = CW = standard _rotate_point convention:
+        dx = math.cos(angle) * rx - math.sin(angle) * ry
+        dy = math.sin(angle) * rx + math.cos(angle) * ry
+        px = dx / fit + info.width / 2.0
+        py = dy / fit + info.height / 2.0
+        wx = info.origin.position.x + px * info.resolution
+        wy = info.origin.position.y + (info.height - py) * info.resolution
+        return wx, wy
 
     def _view_params(self) -> tuple[float, float, float]:
         width = max(1, self._canvas.winfo_width())
@@ -522,35 +759,30 @@ class App:
             return
 
         pil_img = node.map_image
-        ws_w = WORKSPACE_WIDTH
-        ws_h = WORKSPACE_HEIGHT
-
         img_w = pil_img.width
         img_h = pil_img.height
         if img_w <= 0 or img_h <= 0:
             return
 
-        scale_x = ws_w / img_w
-        scale_y = ws_h / img_h
-        fit_scale = min(scale_x, scale_y)
+        canvas_w = self._canvas.winfo_width()
+        canvas_h = self._canvas.winfo_height()
+        usable_w = max(1, canvas_w - VIEW_MARGIN * 2)
+        usable_h = max(1, canvas_h - VIEW_MARGIN * 2)
+        # Scale to canvas pixels (not workspace pixels) so alignment matches _world_to_canvas
+        fit = min(usable_w / img_w, usable_h / img_h)
+        draw_w = max(1, int(img_w * fit))
+        draw_h = max(1, int(img_h * fit))
 
-        draw_w = int(img_w * fit_scale)
-        draw_h = int(img_h * fit_scale)
-
-        offset_x = (ws_w - draw_w) / 2
-        offset_y = (ws_h - draw_h) / 2
-
-        current_hash = (node.latest_map.info.width, node.latest_map.info.height, self._map_rotation)
+        current_hash = (img_w, img_h, self._map_rotation, canvas_w, canvas_h)
         if current_hash != self._last_map_info_hash or self._map_photo is None:
-            rotated = pil_img.rotate(self._map_rotation, resample=Image.NEAREST, expand=True)
-            resized = rotated.resize((draw_w, draw_h), Image.NEAREST)
-            self._map_photo = ImageTk.PhotoImage(resized)
+            # Resize first → then rotate: avoids aspect-ratio distortion on non-square maps
+            resized = pil_img.resize((draw_w, draw_h), Image.NEAREST)
+            rotated = resized.rotate(self._map_rotation, resample=Image.NEAREST, expand=True)
+            self._map_photo = ImageTk.PhotoImage(rotated)
             self._last_map_info_hash = current_hash
 
-        corners = self._workspace_corners()
-        cx = sum(p[0] for p in corners) / len(corners)
-        cy = sum(p[1] for p in corners) / len(corners)
-        self._canvas.create_image(cx, cy, image=self._map_photo, anchor='center', tags=('map_bg',))
+        view_cx, view_cy, _ = self._view_params()
+        self._canvas.create_image(view_cx, view_cy, image=self._map_photo, anchor='center', tags=('map_bg',))
 
     def _workspace_corners(self):
         return [
@@ -590,26 +822,27 @@ class App:
             width=2,
         )
 
-    def _annotation_canvas_center(self, annotation: Annotation) -> tuple[float, float]:
-        view_cx, view_cy, scale = self._view_params()
-        ws_cx = WORKSPACE_WIDTH / 2.0
-        ws_cy = WORKSPACE_HEIGHT / 2.0
-        rx, ry = _rotate_point(annotation.x, annotation.y, ws_cx, ws_cy, self._map_rotation)
-        return (
-            view_cx + (rx - ws_cx) * scale,
-            view_cy + (ry - ws_cy) * scale,
-        )
+    def _annotation_canvas_center(self, annotation: Annotation) -> tuple[float, float] | None:
+        if self._node.latest_map is None:
+            return None
+        return self._world_to_canvas(annotation.x, annotation.y)
 
-    def _annotation_canvas_corners(self, annotation: Annotation) -> list[tuple[float, float]]:
-        center_cx, center_cy = self._annotation_canvas_center(annotation)
-        _view_cx, _view_cy, scale = self._view_params()
-        corners_ws = annotation.corners()
-        rel = [(x - annotation.x, y - annotation.y) for x, y in corners_ws]
-        rel_rot = [_rotate_point(rx, ry, 0, 0, self._map_rotation) for rx, ry in rel]
-        return [(center_cx + rx * scale, center_cy + ry * scale) for rx, ry in rel_rot]
+    def _annotation_canvas_corners(self, annotation: Annotation) -> list[tuple[float, float]] | None:
+        if self._node.latest_map is None:
+            return None
+        half_w = annotation.width / 2.0
+        half_h = annotation.height / 2.0
+        local = [(-half_w, -half_h), (half_w, -half_h), (half_w, half_h), (-half_w, half_h)]
+        world_corners = [
+            _rotate_point(annotation.x + dx, annotation.y + dy, annotation.x, annotation.y, annotation.angle)
+            for dx, dy in local
+        ]
+        return [self._world_to_canvas(wx, wy) for wx, wy in world_corners]
 
     def _draw_annotation(self, annotation: Annotation):
         canvas_points = self._annotation_canvas_corners(annotation)
+        if canvas_points is None:
+            return
         selected = annotation.id in self._selected_ids
         flat_points = [coord for point in canvas_points for coord in point]
         self._canvas.create_polygon(
@@ -633,7 +866,7 @@ class App:
     def _annotation_at(self, canvas_x: float, canvas_y: float) -> Annotation | None:
         for annotation in reversed(self._annotations):
             polygon = self._annotation_canvas_corners(annotation)
-            if _point_in_polygon(canvas_x, canvas_y, polygon):
+            if polygon is not None and _point_in_polygon(canvas_x, canvas_y, polygon):
                 return annotation
         return None
 
@@ -641,7 +874,8 @@ class App:
         self._clear_draft_items()
         mode = self._tool_mode.get()
         if mode == 'add':
-            self._drag_start_map = self._canvas_to_map(event.x, event.y)
+            if self._node.latest_map is not None:
+                self._drag_start_world = self._canvas_to_world(event.x, event.y)
             self._update_status('drag to create area')
             return
         if mode == 'lasso':
@@ -669,14 +903,16 @@ class App:
             self._selected_ids = {annotation.id}
 
         self._dragging_selection = True
-        self._last_drag_map = self._canvas_to_map(event.x, event.y)
+        if self._node.latest_map is not None:
+            self._last_drag_world = self._canvas_to_world(event.x, event.y)
         self._redraw()
         self._update_status('drag selection')
 
     def _on_canvas_drag(self, event):
         mode = self._tool_mode.get()
-        if mode == 'add' and self._drag_start_map is not None:
-            self._draw_draft_area(self._drag_start_map, self._canvas_to_map(event.x, event.y))
+        if mode == 'add' and self._drag_start_world is not None:
+            if self._node.latest_map is not None:
+                self._draw_draft_area(self._drag_start_world, self._canvas_to_world(event.x, event.y))
             return
         if mode == 'lasso' and self._lasso_points:
             point = (event.x, event.y)
@@ -686,59 +922,52 @@ class App:
                 if self._lasso_item is not None:
                     self._canvas.coords(self._lasso_item, *[coord for p in self._lasso_points for coord in p])
             return
-        if mode == 'select' and self._dragging_selection and self._last_drag_map is not None:
-            current = self._canvas_to_map(event.x, event.y)
-            dx = current[0] - self._last_drag_map[0]
-            dy = current[1] - self._last_drag_map[1]
-            for annotation in self._annotations:
-                if annotation.id in self._selected_ids:
-                    annotation.x += dx
-                    annotation.y += dy
-            self._last_drag_map = current
-            self._redraw()
+        if mode == 'select' and self._dragging_selection and self._last_drag_world is not None:
+            if self._node.latest_map is not None:
+                current = self._canvas_to_world(event.x, event.y)
+                dx = current[0] - self._last_drag_world[0]
+                dy = current[1] - self._last_drag_world[1]
+                for annotation in self._annotations:
+                    if annotation.id in self._selected_ids:
+                        annotation.x += dx
+                        annotation.y += dy
+                self._last_drag_world = current
+                self._redraw()
 
     def _on_canvas_release(self, event):
         mode = self._tool_mode.get()
-        if mode == 'add' and self._drag_start_map is not None:
-            start = self._drag_start_map
-            end = self._canvas_to_map(event.x, event.y)
-            self._drag_start_map = None
+        if mode == 'add' and self._drag_start_world is not None:
+            start = self._drag_start_world
+            self._drag_start_world = None
             self._clear_draft_items()
-            self._create_annotation_from_drag(start, end)
+            if self._node.latest_map is not None:
+                self._create_annotation_from_drag(start, self._canvas_to_world(event.x, event.y))
             return
         if mode == 'lasso':
             self._finish_lasso()
             return
         if mode == 'select' and self._dragging_selection:
             self._dragging_selection = False
-            self._last_drag_map = None
+            self._last_drag_world = None
             self._persist_annotations('Moved selection')
 
-    def _draw_draft_area(self, start: tuple[float, float], end: tuple[float, float]):
+    def _draw_draft_area(self, start_world: tuple[float, float], end_world: tuple[float, float]):
         self._clear_draft_items()
-        x1, y1 = start
-        x2, y2 = end
-        cx_ws = (x1 + x2) / 2.0
-        cy_ws = (y1 + y2) / 2.0
+        x1, y1 = start_world
+        x2, y2 = end_world
+        cx_w = (x1 + x2) / 2.0
+        cy_w = (y1 + y2) / 2.0
         half_w = abs(x2 - x1) / 2.0
         half_h = abs(y2 - y1) / 2.0
-        corners_ws = [
-            (cx_ws - half_w, cy_ws - half_h),
-            (cx_ws + half_w, cy_ws - half_h),
-            (cx_ws + half_w, cy_ws + half_h),
-            (cx_ws - half_w, cy_ws + half_h),
+        world_corners = [
+            (cx_w - half_w, cy_w - half_h),
+            (cx_w + half_w, cy_w - half_h),
+            (cx_w + half_w, cy_w + half_h),
+            (cx_w - half_w, cy_w + half_h),
         ]
-        view_cx, view_cy, scale = self._view_params()
-        ws_cx = WORKSPACE_WIDTH / 2.0
-        ws_cy = WORKSPACE_HEIGHT / 2.0
-        rx, ry = _rotate_point(cx_ws, cy_ws, ws_cx, ws_cy, self._map_rotation)
-        center_cx = view_cx + (rx - ws_cx) * scale
-        center_cy = view_cy + (ry - ws_cy) * scale
-        rel = [(x - cx_ws, y - cy_ws) for x, y in corners_ws]
-        rel_rot = [_rotate_point(rx, ry, 0, 0, self._map_rotation) for rx, ry in rel]
-        corners = [(center_cx + rx * scale, center_cy + ry * scale) for rx, ry in rel_rot]
+        canvas_corners = [self._world_to_canvas(wx, wy) for wx, wy in world_corners]
         self._draft_item = self._canvas.create_polygon(
-            [coord for point in corners for coord in point],
+            [coord for point in canvas_corners for coord in point],
             fill='#f59e0b',
             stipple='gray50',
             outline='#ffffff',
@@ -746,12 +975,14 @@ class App:
             dash=(4, 2),
         )
 
-    def _create_annotation_from_drag(self, start: tuple[float, float], end: tuple[float, float]):
-        x1, y1 = start
-        x2, y2 = end
+    def _create_annotation_from_drag(self, start_world: tuple[float, float], end_world: tuple[float, float]):
+        x1, y1 = start_world  # world metres
+        x2, y2 = end_world
         width = abs(x2 - x1)
         height = abs(y2 - y1)
-        if width < 12.0 or height < 12.0:
+        info = self._node.latest_map.info
+        min_size = info.resolution * 2  # at least 2 map cells
+        if width < min_size or height < min_size:
             self._update_status('area too small')
             return
 
@@ -759,6 +990,7 @@ class App:
         if label is None:
             label = f'Annotation {len(self._annotations) + 1}'
         label = label.strip() or f'Annotation {len(self._annotations) + 1}'
+
         annotation = Annotation(
             id=uuid.uuid4().hex,
             label=label,
@@ -784,7 +1016,8 @@ class App:
         self._selected_ids = {
             annotation.id
             for annotation in self._annotations
-            if _point_in_polygon(*self._annotation_canvas_center(annotation), polygon)
+            if (c := self._annotation_canvas_center(annotation)) is not None
+            and _point_in_polygon(*c, polygon)
         }
         self._redraw()
         self._update_status('lasso complete')
@@ -796,8 +1029,8 @@ class App:
             self._draft_item = None
 
     def _clear_interaction(self):
-        self._drag_start_map = None
-        self._last_drag_map = None
+        self._drag_start_world = None
+        self._last_drag_world = None
         self._dragging_selection = False
         self._clear_draft_items()
         if self._lasso_item is not None:
@@ -814,6 +1047,7 @@ class App:
             self._log(f'ERR annotation save failed: {exc}')
         self._redraw()
         self._update_status()
+        self._refresh_annotation_list()
 
     def _selected_annotations(self) -> list[Annotation]:
         return [annotation for annotation in self._annotations if annotation.id in self._selected_ids]
