@@ -319,6 +319,11 @@ class App:
         self._ann_list_frame: tk.Frame | None = None
         self._ann_list_canvas: tk.Canvas | None = None
 
+        self._zoom_level = 1.0
+        self._pan_x = 0.0
+        self._pan_y = 0.0
+        self._pan_drag_prev = (0.0, 0.0)
+
         self._build_ui()
         self._node.on_map_update = lambda: self._root.after(0, self._redraw)
         self._load_annotations()
@@ -352,6 +357,12 @@ class App:
         self._canvas.bind('<ButtonPress-1>', self._on_canvas_press)
         self._canvas.bind('<B1-Motion>', self._on_canvas_drag)
         self._canvas.bind('<ButtonRelease-1>', self._on_canvas_release)
+        self._canvas.bind('<MouseWheel>', self._on_mousewheel)
+        self._canvas.bind('<Button-4>', self._on_mousewheel)
+        self._canvas.bind('<Button-5>', self._on_mousewheel)
+        self._canvas.bind('<ButtonPress-2>', self._on_pan_press)
+        self._canvas.bind('<B2-Motion>', self._on_pan_drag)
+        self._canvas.bind('<ButtonRelease-2>', self._on_pan_release)
         self._root.bind('<Escape>', lambda _event: self._clear_interaction())
         self._root.bind('<Delete>', lambda _event: self._delete_selected())
 
@@ -431,13 +442,6 @@ class App:
         row1.pack(fill='x', pady=(0, 6))
         tk.Button(row1, text='Rename', command=self._rename_selected, width=12).pack(side='left', padx=(0, 6))
         tk.Button(row1, text='Delete', command=self._delete_selected, width=12).pack(side='left')
-
-        row2 = tk.Frame(tools)
-        row2.pack(fill='x', pady=(0, 6))
-        tk.Button(row2, text='Sel -15', command=lambda: self._rotate_selection(-15.0), width=12).pack(
-            side='left', padx=(0, 6)
-        )
-        tk.Button(row2, text='Sel +15', command=lambda: self._rotate_selection(15.0), width=12).pack(side='left')
 
         row3 = tk.Frame(tools)
         row3.pack(fill='x')
@@ -684,7 +688,7 @@ class App:
         info = self._node.latest_map.info
         usable_w = max(1, self._canvas.winfo_width() - VIEW_MARGIN * 2)
         usable_h = max(1, self._canvas.winfo_height() - VIEW_MARGIN * 2)
-        return min(usable_w / info.width, usable_h / info.height)
+        return min(usable_w / info.width, usable_h / info.height) * self._zoom_level
 
     def _world_to_canvas(self, wx: float, wy: float) -> tuple[float, float]:
         """World metres → canvas pixels using PIL-convention rotation (CCW positive)."""
@@ -701,15 +705,15 @@ class App:
         rx = math.cos(angle) * dx + math.sin(angle) * dy
         ry = -math.sin(angle) * dx + math.cos(angle) * dy
         view_cx, view_cy, _ = self._view_params()
-        return (view_cx + rx, view_cy + ry)
+        return (view_cx + rx + self._pan_x, view_cy + ry + self._pan_y)
 
     def _canvas_to_world(self, cx: float, cy: float) -> tuple[float, float]:
         """Canvas pixels → world metres (inverse of _world_to_canvas)."""
         info = self._node.latest_map.info
         fit = self._canvas_fit_scale()
         view_cx, view_cy, _ = self._view_params()
-        rx = cx - view_cx
-        ry = cy - view_cy
+        rx = cx - view_cx - self._pan_x
+        ry = cy - view_cy - self._pan_y
         angle = math.radians(self._map_rotation)
         # Inverse of PIL CCW = CW = standard _rotate_point convention:
         dx = math.cos(angle) * rx - math.sin(angle) * ry
@@ -734,16 +738,16 @@ class App:
         map_cy = WORKSPACE_HEIGHT / 2.0
         rx, ry = _rotate_point(x, y, map_cx, map_cy, self._map_rotation)
         return (
-            view_cx + (rx - map_cx) * scale,
-            view_cy + (ry - map_cy) * scale,
+            view_cx + (rx - map_cx) * scale + self._pan_x,
+            view_cy + (ry - map_cy) * scale + self._pan_y,
         )
 
     def _canvas_to_map(self, x: float, y: float) -> tuple[float, float]:
         view_cx, view_cy, scale = self._view_params()
         map_cx = WORKSPACE_WIDTH / 2.0
         map_cy = WORKSPACE_HEIGHT / 2.0
-        rx = map_cx + (x - view_cx) / scale
-        ry = map_cy + (y - view_cy) / scale
+        rx = map_cx + (x - view_cx - self._pan_x) / scale
+        ry = map_cy + (y - view_cy - self._pan_y) / scale
         return _rotate_point(rx, ry, map_cx, map_cy, -self._map_rotation)
 
     def _redraw(self):
@@ -769,11 +773,11 @@ class App:
         usable_w = max(1, canvas_w - VIEW_MARGIN * 2)
         usable_h = max(1, canvas_h - VIEW_MARGIN * 2)
         # Scale to canvas pixels (not workspace pixels) so alignment matches _world_to_canvas
-        fit = min(usable_w / img_w, usable_h / img_h)
+        fit = min(usable_w / img_w, usable_h / img_h) * self._zoom_level
         draw_w = max(1, int(img_w * fit))
         draw_h = max(1, int(img_h * fit))
 
-        current_hash = (img_w, img_h, self._map_rotation, canvas_w, canvas_h)
+        current_hash = (img_w, img_h, self._map_rotation, canvas_w, canvas_h, self._zoom_level)
         if current_hash != self._last_map_info_hash or self._map_photo is None:
             # Resize first → then rotate: avoids aspect-ratio distortion on non-square maps
             resized = pil_img.resize((draw_w, draw_h), Image.NEAREST)
@@ -782,7 +786,10 @@ class App:
             self._last_map_info_hash = current_hash
 
         view_cx, view_cy, _ = self._view_params()
-        self._canvas.create_image(view_cx, view_cy, image=self._map_photo, anchor='center', tags=('map_bg',))
+        self._canvas.create_image(
+            view_cx + self._pan_x, view_cy + self._pan_y,
+            image=self._map_photo, anchor='center', tags=('map_bg',),
+        )
 
     def _workspace_corners(self):
         return [
@@ -869,6 +876,39 @@ class App:
             if polygon is not None and _point_in_polygon(canvas_x, canvas_y, polygon):
                 return annotation
         return None
+
+    def _on_mousewheel(self, event):
+        if self._node.latest_map is None:
+            return
+        old_zoom = self._zoom_level
+        if event.num == 4 or (hasattr(event, 'delta') and event.delta > 0):
+            self._zoom_level = min(10.0, old_zoom * 1.12)
+        elif event.num == 5 or (hasattr(event, 'delta') and event.delta < 0):
+            self._zoom_level = max(0.12, old_zoom / 1.12)
+        else:
+            return
+        if self._zoom_level == old_zoom:
+            return
+        view_cx, view_cy, _ = self._view_params()
+        ratio = self._zoom_level / old_zoom
+        self._pan_x = (1.0 - ratio) * (event.x - view_cx) + ratio * self._pan_x
+        self._pan_y = (1.0 - ratio) * (event.y - view_cy) + ratio * self._pan_y
+        self._map_photo = None
+        self._redraw()
+
+    def _on_pan_press(self, event):
+        self._pan_drag_prev = (event.x, event.y)
+
+    def _on_pan_drag(self, event):
+        dx = event.x - self._pan_drag_prev[0]
+        dy = event.y - self._pan_drag_prev[1]
+        self._pan_drag_prev = (event.x, event.y)
+        self._pan_x += dx
+        self._pan_y += dy
+        self._canvas.move('all', dx, dy)
+
+    def _on_pan_release(self, _event):
+        self._redraw()
 
     def _on_canvas_press(self, event):
         self._clear_draft_items()
