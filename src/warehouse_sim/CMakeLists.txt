@@ -9,7 +9,10 @@ install(
 )
 
 install(
-  PROGRAMS scripts/autonomous_mapper.py
+  PROGRAMS
+    scripts/autonomous_mapper.py
+    scripts/odom_tf_broadcaster.py
+    scripts/map_manager_gui.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

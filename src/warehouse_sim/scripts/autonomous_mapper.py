@@ -528,7 +528,7 @@ class AutonomousMapper(Node):
 
     def local_obstacle_requires_recovery(self) -> bool:
         front = self.sector_distance(-30.0, 30.0)
-        return front < self.front_clearance
+        return front < self.emergency_clearance
 
     def set_recovery_from_scan(self):
         left = self.sector_distance(45.0, 130.0)

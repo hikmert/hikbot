@@ -1,9 +1,10 @@
-# ROS 2 / colcon build artifacts
+# ── ROS 2 / colcon ────────────────────────────────────────────────────────────
 build/
 install/
 log/
+.colcon/
 
-# Python
+# ── Python ────────────────────────────────────────────────────────────────────
 venv/
 __pycache__/
 *.py[cod]
@@ -14,17 +15,31 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
-# Editor / IDE
+# ── SLAM / map artifacts (generated, binary, large) ───────────────────────────
+maps/
+*.posegraph
+*.data
+*.pgm
+*.bag
+*.db3
+*.mcap
+
+# ── Gazebo / simulation cache ─────────────────────────────────────────────────
+.gz/
+.gazebo/
+
+# ── Editor / IDE ──────────────────────────────────────────────────────────────
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
+*.orig
 
-# OS
+# ── OS ────────────────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
 
-# Logs / temp
+# ── Logs / temp ───────────────────────────────────────────────────────────────
 *.log
 *.tmp

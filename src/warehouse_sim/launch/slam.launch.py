@@ -10,6 +10,12 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
+_MAP_FILE = os.path.join(
+    os.path.normpath(os.path.join(get_package_share_directory('warehouse_sim'),
+                                  '..', '..', '..', '..')),
+    'maps', 'warehouse_map'
+)
+
 
 def generate_launch_description():
     pkg_share = get_package_share_directory('warehouse_sim')
@@ -36,12 +42,32 @@ def generate_launch_description():
         }.items(),
     )
 
+    slam_extra: dict = {'use_sim_time': use_sim_time}
+    if os.path.exists(_MAP_FILE + '.posegraph'):
+        slam_extra['map_file_name'] = _MAP_FILE
+        slam_extra['map_start_at_dock'] = False
+        print(f'[slam.launch] Loading existing map: {_MAP_FILE}')
+    else:
+        print('[slam.launch] No existing map — starting fresh.')
+
     slam = Node(
         package='slam_toolbox',
         executable='async_slam_toolbox_node',
         name='slam_toolbox',
         output='screen',
-        parameters=[slam_params, {'use_sim_time': use_sim_time}],
+        parameters=[slam_params, slam_extra],
+    )
+
+    lifecycle_manager = Node(
+        package='nav2_lifecycle_manager',
+        executable='lifecycle_manager',
+        name='lifecycle_manager_slam',
+        output='screen',
+        parameters=[{
+            'use_sim_time': use_sim_time,
+            'autostart': True,
+            'node_names': ['slam_toolbox'],
+        }],
     )
 
     rviz = Node(
@@ -63,20 +89,29 @@ def generate_launch_description():
             'use_sim_time': use_sim_time,
             'map_frame': 'map',
             'base_frame': 'base_link',
-            'linear_speed': 0.24,
-            'slow_linear_speed': 0.12,
+            'linear_speed': 0.50,
+            'slow_linear_speed': 0.25,
             'max_angular_speed': 0.90,
-            'startup_turn_speed': 0.45,
+            'startup_turn_speed': 0.60,
             'front_clearance': 0.90,
             'emergency_clearance': 0.42,
             'slow_clearance': 1.35,
             'side_clearance': 0.55,
-            'startup_spin_duration': 12.5,
+            'startup_spin_duration': 7.0,
             'obstacle_inflation_radius': 0.32,
             'min_frontier_size': 14,
-            'replan_interval': 2.0,
+            'replan_interval': 1.5,
+            'max_frontier_plans': 5,
+            'max_astar_expansions': 60000,
         }],
         condition=IfCondition(autostart_mapper),
+    )
+
+    map_manager = Node(
+        package='warehouse_sim',
+        executable='map_manager_gui.py',
+        name='map_manager',
+        output='screen',
     )
 
     return LaunchDescription([
@@ -84,6 +119,8 @@ def generate_launch_description():
         declare_autostart_mapper,
         warehouse,
         slam,
+        lifecycle_manager,
         mapper,
+        map_manager,
         rviz,
     ])

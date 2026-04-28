@@ -99,16 +99,14 @@ def generate_launch_description():
         output='screen',
     )
 
-    # Bridge DiffDrive's Pose_V (gz) → /tf (ROS) so odom→base_link gets published.
-    # Must run un-namespaced — /tf is a global topic.
+    # Publish odom→base_link TF from the Odometry topic.
+    # The gz Pose_V→TFMessage bridge is unreliable in Gazebo Harmonic.
     tf_bridge = Node(
-        package='ros_gz_bridge',
-        executable='parameter_bridge',
-        name='tf_bridge',
-        arguments=['/model/hikbot/tf_diff@tf2_msgs/msg/TFMessage[gz.msgs.Pose_V'],
-        remappings=[('/model/hikbot/tf_diff', '/tf')],
-        parameters=[{'use_sim_time': use_sim_time}],
+        package='warehouse_sim',
+        executable='odom_tf_broadcaster.py',
+        name='odom_tf_broadcaster',
         output='screen',
+        parameters=[{'use_sim_time': use_sim_time}],
     )
 
     static_tf_nodes = []
