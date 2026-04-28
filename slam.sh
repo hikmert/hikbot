@@ -47,6 +47,8 @@ source "$ROS_SETUP"
 info "ROS 2 Jazzy sourced."
 
 chmod +x "$WORKSPACE/src/warehouse_sim/scripts/autonomous_mapper.py" 2>/dev/null || true
+chmod +x "$WORKSPACE/src/warehouse_sim/scripts/map_manager_gui.py" 2>/dev/null || true
+chmod +x "$WORKSPACE/src/warehouse_sim/scripts/odom_tf_broadcaster.py" 2>/dev/null || true
 
 if [[ "$NO_BUILD" != "1" ]]; then
     info "Building warehouse_sim..."

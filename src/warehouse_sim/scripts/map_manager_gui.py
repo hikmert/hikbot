@@ -16,7 +16,11 @@ from tkinter import filedialog, messagebox, simpledialog
 import rclpy
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from slam_toolbox.srv import DeserializePoseGraph, Reset, SerializePoseGraph
+
+from nav_msgs.msg import OccupancyGrid
+from PIL import Image, ImageTk
 
 MAP_DIR = os.path.expanduser('~/otonom_projeler/hikbot/maps')
 MAP_FILE = os.path.join(MAP_DIR, 'warehouse_map')
@@ -129,6 +133,44 @@ class MapManagerNode(Node):
         self._load_cli = self.create_client(DeserializePoseGraph, '/slam_toolbox/deserialize_map')
         self._reset_cli = self.create_client(Reset, '/slam_toolbox/reset')
 
+        map_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self._map_sub = self.create_subscription(OccupancyGrid, '/map', self._on_map, map_qos)
+        self.latest_map: OccupancyGrid | None = None
+        self.map_image: Image.Image | None = None
+        self.on_map_update = None
+
+    def _on_map(self, msg: OccupancyGrid):
+        self.latest_map = msg
+        try:
+            self.map_image = self._occupancy_to_image(msg)
+        except Exception:
+            pass
+        if self.on_map_update:
+            self.on_map_update()
+
+    @staticmethod
+    def _occupancy_to_image(msg: OccupancyGrid) -> Image.Image:
+        width = msg.info.width
+        height = msg.info.height
+        data = bytearray(width * height * 3)
+        for i, val in enumerate(msg.data):
+            offset = i * 3
+            if val == -1:
+                data[offset : offset + 3] = bytes([128, 128, 128])
+            elif val == 0:
+                data[offset : offset + 3] = bytes([255, 255, 255])
+            elif val == 100:
+                data[offset : offset + 3] = bytes([0, 0, 0])
+            else:
+                v = max(0, min(255, 255 - int(val * 2.55)))
+                data[offset : offset + 3] = bytes([v, v, v])
+        return Image.frombytes('RGB', (width, height), bytes(data))
+
     def save(self, path: str, callback):
         self._do_save(_strip_posegraph(path), callback)
 
@@ -222,8 +264,11 @@ class App:
         self._lasso_points: list[tuple[float, float]] = []
         self._lasso_item: int | None = None
         self._last_canvas_size = (0, 0)
+        self._map_photo: ImageTk.PhotoImage | None = None
+        self._last_map_info_hash = None
 
         self._build_ui()
+        self._node.on_map_update = lambda: self._root.after(0, self._redraw)
         self._load_annotations()
         self._schedule_autosave()
         self._root.protocol('WM_DELETE_WINDOW', self._on_close)
@@ -435,6 +480,7 @@ class App:
         size = (event.width, event.height)
         if size != self._last_canvas_size:
             self._last_canvas_size = size
+            self._map_photo = None
             self._redraw()
 
     def _view_params(self) -> tuple[float, float, float]:
@@ -465,18 +511,58 @@ class App:
 
     def _redraw(self):
         self._canvas.delete('all')
+        self._draw_map_image()
         self._draw_workspace()
         for annotation in self._annotations:
             self._draw_annotation(annotation)
 
-    def _draw_workspace(self):
-        corners = [
+    def _draw_map_image(self):
+        node = self._node
+        if node.map_image is None:
+            return
+
+        pil_img = node.map_image
+        ws_w = WORKSPACE_WIDTH
+        ws_h = WORKSPACE_HEIGHT
+
+        img_w = pil_img.width
+        img_h = pil_img.height
+        if img_w <= 0 or img_h <= 0:
+            return
+
+        scale_x = ws_w / img_w
+        scale_y = ws_h / img_h
+        fit_scale = min(scale_x, scale_y)
+
+        draw_w = int(img_w * fit_scale)
+        draw_h = int(img_h * fit_scale)
+
+        offset_x = (ws_w - draw_w) / 2
+        offset_y = (ws_h - draw_h) / 2
+
+        current_hash = (node.latest_map.info.width, node.latest_map.info.height, self._map_rotation)
+        if current_hash != self._last_map_info_hash or self._map_photo is None:
+            rotated = pil_img.rotate(self._map_rotation, resample=Image.NEAREST, expand=True)
+            resized = rotated.resize((draw_w, draw_h), Image.NEAREST)
+            self._map_photo = ImageTk.PhotoImage(resized)
+            self._last_map_info_hash = current_hash
+
+        corners = self._workspace_corners()
+        cx = sum(p[0] for p in corners) / len(corners)
+        cy = sum(p[1] for p in corners) / len(corners)
+        self._canvas.create_image(cx, cy, image=self._map_photo, anchor='center', tags=('map_bg',))
+
+    def _workspace_corners(self):
+        return [
             self._map_to_canvas(0, 0),
             self._map_to_canvas(WORKSPACE_WIDTH, 0),
             self._map_to_canvas(WORKSPACE_WIDTH, WORKSPACE_HEIGHT),
             self._map_to_canvas(0, WORKSPACE_HEIGHT),
         ]
-        self._canvas.create_polygon(corners, fill='#17202a', outline='#607083', width=2)
+
+    def _draw_workspace(self):
+        corners = self._workspace_corners()
+        self._canvas.create_polygon(corners, fill='', outline='#607083', width=2)
 
         for x in range(0, WORKSPACE_WIDTH + 1, GRID_STEP):
             self._canvas.create_line(
@@ -504,8 +590,26 @@ class App:
             width=2,
         )
 
+    def _annotation_canvas_center(self, annotation: Annotation) -> tuple[float, float]:
+        view_cx, view_cy, scale = self._view_params()
+        ws_cx = WORKSPACE_WIDTH / 2.0
+        ws_cy = WORKSPACE_HEIGHT / 2.0
+        rx, ry = _rotate_point(annotation.x, annotation.y, ws_cx, ws_cy, self._map_rotation)
+        return (
+            view_cx + (rx - ws_cx) * scale,
+            view_cy + (ry - ws_cy) * scale,
+        )
+
+    def _annotation_canvas_corners(self, annotation: Annotation) -> list[tuple[float, float]]:
+        center_cx, center_cy = self._annotation_canvas_center(annotation)
+        _view_cx, _view_cy, scale = self._view_params()
+        corners_ws = annotation.corners()
+        rel = [(x - annotation.x, y - annotation.y) for x, y in corners_ws]
+        rel_rot = [_rotate_point(rx, ry, 0, 0, self._map_rotation) for rx, ry in rel]
+        return [(center_cx + rx * scale, center_cy + ry * scale) for rx, ry in rel_rot]
+
     def _draw_annotation(self, annotation: Annotation):
-        canvas_points = [self._map_to_canvas(x, y) for x, y in annotation.corners()]
+        canvas_points = self._annotation_canvas_corners(annotation)
         selected = annotation.id in self._selected_ids
         flat_points = [coord for point in canvas_points for coord in point]
         self._canvas.create_polygon(
@@ -516,7 +620,7 @@ class App:
             width=3 if selected else 2,
             tags=('annotation', annotation.id),
         )
-        cx, cy = self._map_to_canvas(annotation.x, annotation.y)
+        cx, cy = self._annotation_canvas_center(annotation)
         self._canvas.create_text(
             cx,
             cy,
@@ -528,7 +632,7 @@ class App:
 
     def _annotation_at(self, canvas_x: float, canvas_y: float) -> Annotation | None:
         for annotation in reversed(self._annotations):
-            polygon = [self._map_to_canvas(x, y) for x, y in annotation.corners()]
+            polygon = self._annotation_canvas_corners(annotation)
             if _point_in_polygon(canvas_x, canvas_y, polygon):
                 return annotation
         return None
@@ -614,12 +718,25 @@ class App:
         self._clear_draft_items()
         x1, y1 = start
         x2, y2 = end
-        corners = [
-            self._map_to_canvas(x1, y1),
-            self._map_to_canvas(x2, y1),
-            self._map_to_canvas(x2, y2),
-            self._map_to_canvas(x1, y2),
+        cx_ws = (x1 + x2) / 2.0
+        cy_ws = (y1 + y2) / 2.0
+        half_w = abs(x2 - x1) / 2.0
+        half_h = abs(y2 - y1) / 2.0
+        corners_ws = [
+            (cx_ws - half_w, cy_ws - half_h),
+            (cx_ws + half_w, cy_ws - half_h),
+            (cx_ws + half_w, cy_ws + half_h),
+            (cx_ws - half_w, cy_ws + half_h),
         ]
+        view_cx, view_cy, scale = self._view_params()
+        ws_cx = WORKSPACE_WIDTH / 2.0
+        ws_cy = WORKSPACE_HEIGHT / 2.0
+        rx, ry = _rotate_point(cx_ws, cy_ws, ws_cx, ws_cy, self._map_rotation)
+        center_cx = view_cx + (rx - ws_cx) * scale
+        center_cy = view_cy + (ry - ws_cy) * scale
+        rel = [(x - cx_ws, y - cy_ws) for x, y in corners_ws]
+        rel_rot = [_rotate_point(rx, ry, 0, 0, self._map_rotation) for rx, ry in rel]
+        corners = [(center_cx + rx * scale, center_cy + ry * scale) for rx, ry in rel_rot]
         self._draft_item = self._canvas.create_polygon(
             [coord for point in corners for coord in point],
             fill='#f59e0b',
@@ -667,7 +784,7 @@ class App:
         self._selected_ids = {
             annotation.id
             for annotation in self._annotations
-            if _point_in_polygon(*self._map_to_canvas(annotation.x, annotation.y), polygon)
+            if _point_in_polygon(*self._annotation_canvas_center(annotation), polygon)
         }
         self._redraw()
         self._update_status('lasso complete')

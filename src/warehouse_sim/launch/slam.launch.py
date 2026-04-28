@@ -112,6 +112,7 @@ def generate_launch_description():
         executable='map_manager_gui.py',
         name='map_manager',
         output='screen',
+        parameters=[{'use_sim_time': use_sim_time}],
     )
 
     return LaunchDescription([
