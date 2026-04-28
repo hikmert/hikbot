@@ -36,6 +36,7 @@ def generate_launch_description():
 
     use_sim_time = LaunchConfiguration('use_sim_time')
     launch_rviz = LaunchConfiguration('launch_rviz')
+    launch_teleop = LaunchConfiguration('launch_teleop')
 
     declare_use_sim_time = DeclareLaunchArgument(
         'use_sim_time', default_value='true',
@@ -44,6 +45,10 @@ def generate_launch_description():
     declare_launch_rviz = DeclareLaunchArgument(
         'launch_rviz', default_value='true',
         description='Launch default RViz with the warehouse config.')
+
+    declare_launch_teleop = DeclareLaunchArgument(
+        'launch_teleop', default_value='true',
+        description='Launch teleop_twist_keyboard in an xterm window.')
 
     # Make our local models discoverable by Gazebo (for any future <include>s)
     set_resource_path = SetEnvironmentVariable(
@@ -105,8 +110,8 @@ def generate_launch_description():
         package='ros_gz_bridge',
         executable='parameter_bridge',
         name='tf_bridge',
-        arguments=['/model/hikbot/tf_diff@tf2_msgs/msg/TFMessage[gz.msgs.Pose_V'],
-        remappings=[('/model/hikbot/tf_diff', '/tf')],
+        arguments=['/tf_diff@tf2_msgs/msg/TFMessage[gz.msgs.Pose_V'],
+        remappings=[('/tf_diff', '/tf')],
         parameters=[{'use_sim_time': use_sim_time}],
         output='screen',
     )
@@ -135,9 +140,20 @@ def generate_launch_description():
         condition=IfCondition(launch_rviz),
     )
 
+    teleop = Node(
+        package='teleop_twist_keyboard',
+        executable='teleop_twist_keyboard',
+        name='teleop_twist_keyboard',
+        prefix='xterm -e',
+        output='screen',
+        remappings=[('/cmd_vel', '/hikbot/cmd_vel')],
+        condition=IfCondition(launch_teleop),
+    )
+
     return LaunchDescription([
         declare_use_sim_time,
         declare_launch_rviz,
+        declare_launch_teleop,
         set_resource_path,
         gz_sim,
         spawn_robot,
@@ -146,4 +162,5 @@ def generate_launch_description():
         tf_bridge,
         *static_tf_nodes,
         rviz,
+        teleop,
     ])

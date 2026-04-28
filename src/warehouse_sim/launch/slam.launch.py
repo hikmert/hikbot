@@ -4,7 +4,7 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, TimerAction
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
@@ -15,6 +15,8 @@ def generate_launch_description():
     slam_params = os.path.join(pkg_share, 'config', 'slam_toolbox.yaml')
     slam_rviz = os.path.join(pkg_share, 'rviz', 'slam.rviz')
     base_launch = os.path.join(pkg_share, 'launch', 'warehouse.launch.py')
+    slam_toolbox_launch = os.path.join(
+        get_package_share_directory('slam_toolbox'), 'launch', 'online_async_launch.py')
 
     use_sim_time = LaunchConfiguration('use_sim_time')
 
@@ -30,12 +32,16 @@ def generate_launch_description():
         }.items(),
     )
 
-    slam = Node(
-        package='slam_toolbox',
-        executable='async_slam_toolbox_node',
-        name='slam_toolbox',
-        output='screen',
-        parameters=[slam_params, {'use_sim_time': use_sim_time}],
+    # Use slam_toolbox's own launch which handles LifecycleNode configure+activate.
+    slam = TimerAction(
+        period=5.0,
+        actions=[IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(slam_toolbox_launch),
+            launch_arguments={
+                'slam_params_file': slam_params,
+                'use_sim_time': 'true',
+            }.items(),
+        )],
     )
 
     rviz = Node(
